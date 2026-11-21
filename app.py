@@ -9,11 +9,17 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "change-me-in-production")
-db_url = os.environ.get("DATABASE_URL", "sqlite:///quiz.db")
+db_url = os.environ.get("DATABASE_URL")
+if not db_url:  # fallback only (Vercel has no permanent disk, so set DATABASE_URL there)
+    db_url = "sqlite:////tmp/quiz.db" if os.environ.get("VERCEL") else "sqlite:///quiz.db"
 if db_url.startswith("mysql://"):
     db_url = db_url.replace("mysql://", "mysql+pymysql://", 1)
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url
-app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"pool_pre_ping": True}
+engine_opts = {"pool_pre_ping": True, "pool_recycle": 280}
+if db_url.startswith("mysql") and os.environ.get("DB_SSL", "1") == "1":  # cloud MySQL needs SSL
+    import certifi
+    engine_opts["connect_args"] = {"ssl": {"ca": certifi.where()}}
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = engine_opts
 db = SQLAlchemy(app)
 
 GRACE_SECONDS = 30
@@ -454,7 +460,18 @@ def init_db():
             for s in ["Python", "Mathematics", "General Knowledge"]:
                 db.session.add(Subject(name=s))
             db.session.commit()
-init_db()
+DB_READY, DB_ERROR = False, None
+
+@app.before_request
+def ensure_db():  # create tables on first request; show the real error if DB connection fails
+    global DB_READY, DB_ERROR
+    if DB_READY: return
+    try:
+        init_db(); DB_READY, DB_ERROR = True, None
+    except Exception as e:
+        DB_ERROR = f"{type(e).__name__}: {e}"[:900]
+        return ("<h2>Database connection error</h2><p>Check DATABASE_URL in Vercel settings, then Redeploy.</p>"
+                f"<pre style='white-space:pre-wrap'>{DB_ERROR}</pre>"), 500
 
 if __name__ == "__main__":
     app.run(debug=True)
